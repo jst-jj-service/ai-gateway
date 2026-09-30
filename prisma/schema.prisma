@@ -1,0 +1,104 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id             String          @id @default(cuid())
+  email          String          @unique
+  passwordHash   String
+  name           String?
+  role           Role            @default(USER)
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  apiKeys        ApiKey[]
+  usageRecords   UsageRecord[]
+  cdkRedemptions CdkRedemption[]
+  quota          UserQuota?
+
+  @@index([email])
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  keyHash    String    @unique
+  keyPrefix  String
+  name       String    @default("Default Key")
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isActive   Boolean   @default(true)
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  usageRecords UsageRecord[]
+
+  @@index([userId])
+}
+
+model Cdk {
+  id          String         @id @default(cuid())
+  code        String         @unique // Format: CDK-XXXX-XXXX-XXXX
+  tokenQuota  BigInt                  // Tokens granted (e.g., 1_000_000, 5_000_000)
+  tier        String         @default("standard")
+  isRedeemed  Boolean        @default(false)
+  expiresAt   DateTime?
+  createdAt   DateTime       @default(now())
+
+  redemption  CdkRedemption?
+
+  @@index([code])
+}
+
+model CdkRedemption {
+  id          String   @id @default(cuid())
+  cdkId       String   @unique
+  cdk         Cdk      @relation(fields: [cdkId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokensAdded BigInt
+  redeemedAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+model UserQuota {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  totalTokens     BigInt   @default(0) // Total quota ever granted
+  usedTokens      BigInt   @default(0) // Total tokens consumed
+  cachedTokens    BigInt   @default(0) // Total tokens served from cache
+  remainingTokens BigInt   @default(0) // Available tokens left to use
+  updatedAt       DateTime @updatedAt
+}
+
+model UsageRecord {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  apiKeyId          String?
+  apiKey            ApiKey?  @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  model             String
+  promptTokens      Int
+  completionTokens  Int
+  cachedTokens      Int      @default(0)
+  totalTokens       Int
+  requestDurationMs Int
+  statusCode        Int
+  isStream          Boolean  @default(false)
+  createdAt         DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+}
