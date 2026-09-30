@@ -1,0 +1,37 @@
+{
+  "name": "@ai-gateway/api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fastify backend for AI Gateway with membership, quota, and error-sanitizing proxy",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "prisma generate && tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "tsx tests/run-all-tests.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@fastify/helmet": "^11.1.1",
+    "@fastify/jwt": "^8.0.1",
+    "@fastify/rate-limit": "^9.1.0",
+    "@prisma/client": "^5.14.0",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "eventsource-parser": "^1.1.2",
+    "fastify": "^4.27.0",
+    "ioredis": "^5.4.1",
+    "undici": "^6.18.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.12.12",
+    "prisma": "^5.14.0",
+    "tsx": "^4.10.5",
+    "typescript": "^5.4.5"
+  }
+}
