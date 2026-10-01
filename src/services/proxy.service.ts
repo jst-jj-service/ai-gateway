@@ -218,7 +218,8 @@ export class ProxyService {
 
     // Ensure upstream provides token usage details in streaming mode, and cap max_tokens to prevent free usage
     const proxyBody = { ...body };
-    proxyBody.model = cleanModel;
+    const normalizedCleanModel = normalizeModelAlias(cleanModel);
+    proxyBody.model = normalizedCleanModel;
     if (typeof body.max_completion_tokens === 'number') {
       proxyBody.max_completion_tokens = upstreamMaxCompletion;
     } else {
@@ -713,7 +714,8 @@ export class ProxyService {
 
     // Build capped proxy body to prevent upstream burning tokens beyond available quota
     const proxyBody = { ...body };
-    proxyBody.model = cleanModel;
+    const normalizedCleanModel = normalizeModelAlias(cleanModel);
+    proxyBody.model = normalizedCleanModel;
     if (typeof body.max_tokens === 'number' && typeof body.max_output_tokens !== 'number') {
       proxyBody.max_tokens = upstreamMaxOutput;
     } else {
