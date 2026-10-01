@@ -87,6 +87,22 @@ export async function v1Routes(
     return proxyService.handleMessages(req, reply, req.user!);
   });
 
+  // POST /v1/embeddings (OpenAI Embeddings API)
+  fastify.post('/v1/embeddings', async (req, reply) => {
+    const passed = await proxyPreHandler(req, reply);
+    if (!passed) return;
+
+    return proxyService.handleEmbeddings(req, reply, req.user!);
+  });
+
+  // POST /embeddings (Direct route for clients pointing BASE_URL to /v1 or root)
+  fastify.post('/embeddings', async (req, reply) => {
+    const passed = await proxyPreHandler(req, reply);
+    if (!passed) return;
+
+    return proxyService.handleEmbeddings(req, reply, req.user!);
+  });
+
   // GET /v1/models
   fastify.get('/v1/models', async (req, reply) => {
     const isAuth = await authPlugin.authenticate(req, reply);
@@ -97,5 +113,45 @@ export async function v1Routes(
     if (!isAllowed) return;
 
     return proxyService.handleGetModels(reply);
+  });
+
+  // GET /models (Direct route for clients pointing BASE_URL to /v1 or root)
+  fastify.get('/models', async (req, reply) => {
+    const isAuth = await authPlugin.authenticate(req, reply);
+    if (!isAuth || !req.user) return;
+
+    const limitKey = req.user.apiKeyId || req.user.id;
+    const isAllowed = await rateLimiter.checkRateLimit(req, reply, limitKey);
+    if (!isAllowed) return;
+
+    return proxyService.handleGetModels(reply);
+  });
+
+  // GET /v1/models/:model (Single model lookup)
+  fastify.get<{ Params: { model: string } }>('/v1/models/:model', async (req, reply) => {
+    const isAuth = await authPlugin.authenticate(req, reply);
+    if (!isAuth || !req.user) return;
+
+    const modelName = req.params.model;
+    return reply.code(200).send({
+      id: modelName,
+      object: 'model',
+      created: 1740000000,
+      owned_by: 'system'
+    });
+  });
+
+  // GET /models/:model
+  fastify.get<{ Params: { model: string } }>('/models/:model', async (req, reply) => {
+    const isAuth = await authPlugin.authenticate(req, reply);
+    if (!isAuth || !req.user) return;
+
+    const modelName = req.params.model;
+    return reply.code(200).send({
+      id: modelName,
+      object: 'model',
+      created: 1740000000,
+      owned_by: 'system'
+    });
   });
 }
