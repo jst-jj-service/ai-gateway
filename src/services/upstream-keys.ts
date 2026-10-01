@@ -10,30 +10,43 @@ export const DEFAULT_UPSTREAM_KEYS: UpstreamKey[] = [
   {
     name: 'GPT007',
     apiKey: 'sk-d0db48ab1df2eff985afb32c3c7f12e86b1c12ffa653fbf187944830053b0ce6',
-    group: 'GPT Starter | 0.07x',
-    rate: 0.07,
+    group: 'GPT Starter | 0.16x',
+    rate: 0.1625,
     models: [
-      'gpt-4o-mini'
+      'gpt-4o-mini',
+      'gpt-5.4-mini',
+      'gpt-5.5',
+      'gpt-5.4',
+      'codex-auto-review',
+      'gpt-5.3-codex-spark'
     ]
   },
   {
     name: 'GPT016',
     apiKey: 'sk-ee6a1c068497fd6127f1e53c6c80a3fe711513dcbb54c8db6e2cdf1f851f5653',
-    group: 'GPT Plus | 0.16x',
-    rate: 0.16,
+    group: 'GPT Plus | 0.325x',
+    rate: 0.325,
     models: [
       'gpt-4o',
-      'chatgpt-4o-latest'
+      'chatgpt-4o-latest',
+      'gpt-5.6',
+      'gpt-5.2',
+      'gpt-5.2-chat-latest',
+      'gpt-5.4-2026-03-05'
     ]
   },
   {
     name: 'GPT020',
     apiKey: 'sk-4b241e4bcef324c48cee39d8f4643d1451456217b401b0d088fefc6011cfb931',
-    group: 'GPT Pro | 0.20x',
-    rate: 0.20,
+    group: 'GPT Pro | 0.45x',
+    rate: 0.45,
     models: [
       'sol',
       'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-6-sol',
+      'gpt-6.1-sol',
       'o1-mini',
       'o1-preview'
     ]
@@ -41,11 +54,13 @@ export const DEFAULT_UPSTREAM_KEYS: UpstreamKey[] = [
   {
     name: 'GPT030',
     apiKey: 'sk-910394158ac1cb03ee4899c8fa8d4055e4a6b651b9e9edeb0a6599accc17f29f',
-    group: 'GPT Pro Flagship | 0.30x',
-    rate: 0.30,
+    group: 'GPT Flagship Pro | 0.45x',
+    rate: 0.45,
     models: [
       'astra',
       'gpt-6-astra',
+      'gpt-6',
+      'gpt-6-luna',
       'o1',
       'o1-2024-12-17',
       'o3-mini',
@@ -55,33 +70,58 @@ export const DEFAULT_UPSTREAM_KEYS: UpstreamKey[] = [
   {
     name: 'Claude0.13',
     apiKey: 'sk-531091eb31daa8d83752916b32e4cd0bf01158a037f9d5cbd4a0c684c101c406',
-    group: 'Opus 5 | 0.13x',
-    rate: 0.13,
+    group: 'Claude Standard | 0.24x',
+    rate: 0.24,
     models: [
-      'claude-3-5-sonnet-20241022',
-      'claude-3-5-haiku-20241022',
-      'claude-opus-5'
+      'fable',
+      'claude-fable-5',
+      'claude-fable-5-1',
+      'claude-fable-5.1',
+      'claude-opus-5',
+      'claude-opus-5-5',
+      'claude-sonnet-5',
+      'claude-sonnet-4-6',
+      'claude-sonnet-4-5',
+      'claude-haiku-4-5',
+      'claude-3-5-haiku-20241022'
     ]
   },
   {
     name: 'Claude1.6x',
     apiKey: 'sk-a19db913a562633ee3684d1413600b21be8f9cb3035de6a749d79f4829d24465',
-    group: 'Claude Max | 1.6x',
-    rate: 1.60,
+    group: 'Claude Max | 3.00x',
+    rate: 3.00,
     models: [
+      'claude-3-7-sonnet-20250219',
       'claude-3-5-sonnet-20241022',
-      'claude-opus-5'
+      'claude-3-5-sonnet-20240620',
+      'claude-sonnet-5-5',
+      'claude-opus-4-5',
+      'claude-max'
     ]
   }
 ];
 
 export const MODEL_ALIASES: Record<string, string> = {
+  'astra': 'gpt-6-astra',
+  'sol': 'gpt-5.6-sol',
+  'terra': 'gpt-5.6-terra',
+  'fable': 'claude-fable-5',
+  'claude-fable': 'claude-fable-5',
+  'claude-3.7-sonnet': 'claude-3-7-sonnet-20250219',
+  'claude-3-7-sonnet': 'claude-3-7-sonnet-20250219',
+  'claude-3-7-sonnet-latest': 'claude-3-7-sonnet-20250219',
   'claude-3.5-sonnet': 'claude-3-5-sonnet-20241022',
+  'claude-3-5-sonnet': 'claude-3-5-sonnet-20241022',
+  'claude-3-5-sonnet-latest': 'claude-3-5-sonnet-20241022',
   'claude-3.5-haiku': 'claude-3-5-haiku-20241022',
-  'claude-3-opus': 'claude-3-opus-20240229',
-  'claude-3.0-opus': 'claude-3-opus-20240229',
+  'claude-3-5-haiku': 'claude-3-5-haiku-20241022',
+  'claude-3-5-haiku-latest': 'claude-3-5-haiku-20241022',
+  'claude-3-opus': 'claude-opus-5',
+  'claude-3.0-opus': 'claude-opus-5',
   'claude-3.5-opus': 'claude-opus-5',
   'claude-opus': 'claude-opus-5',
+  'claude-opus-latest': 'claude-opus-5',
   'chatgpt-4o': 'chatgpt-4o-latest',
   'o1': 'o1-2024-12-17'
 };
