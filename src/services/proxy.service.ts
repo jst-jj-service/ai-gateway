@@ -431,7 +431,8 @@ export class ProxyService {
           const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? 0;
           const totalTokens = Math.min(usage?.total_tokens ?? (promptTokens + completionTokens), maxAllowedTokens);
 
-          actualTokensUsed = totalTokens;
+          const rateMultiplier = selectedKey?.rate ?? 1.0;
+          actualTokensUsed = Math.round(totalTokens * rateMultiplier);
           cachedTokensUsed = cachedTokens;
           finalStatusCode = 200;
 
@@ -443,6 +444,8 @@ export class ProxyService {
             completionTokens,
             cachedTokens,
             totalTokens,
+            deductedTokens: actualTokensUsed,
+            rateMultiplier,
             requestDurationMs: Date.now() - startTime,
             statusCode: 200,
             isStream: true,
@@ -518,7 +521,8 @@ export class ProxyService {
         const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? 0;
         const totalTokens = usage.total_tokens ?? (promptTokens + completionTokens);
 
-        actualTokensUsed = totalTokens;
+        const rateMultiplier = selectedKey?.rate ?? 1.0;
+        actualTokensUsed = Math.round(totalTokens * rateMultiplier);
         cachedTokensUsed = cachedTokens;
         finalStatusCode = 200;
 
@@ -530,6 +534,8 @@ export class ProxyService {
           completionTokens,
           cachedTokens,
           totalTokens,
+          deductedTokens: actualTokensUsed,
+          rateMultiplier,
           requestDurationMs: Date.now() - startTime,
           statusCode: 200,
           isStream: false,
@@ -917,7 +923,8 @@ export class ProxyService {
         const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? 0;
         const totalTokens = Math.min(usage?.total_tokens ?? (promptTokens + completionTokens), maxAllowedTokens);
 
-        actualTokensUsed = totalTokens;
+        const rateMultiplier = selectedKey?.rate ?? 1.0;
+        actualTokensUsed = Math.round(totalTokens * rateMultiplier);
         cachedTokensUsed = cachedTokens;
         finalStatusCode = 200;
 
@@ -929,6 +936,8 @@ export class ProxyService {
           completionTokens,
           cachedTokens,
           totalTokens,
+          deductedTokens: actualTokensUsed,
+          rateMultiplier,
           requestDurationMs: Date.now() - startTime,
           statusCode: 200,
           isStream: true,
@@ -994,7 +1003,8 @@ export class ProxyService {
       const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? 0;
       const totalTokens = usage.total_tokens ?? (promptTokens + completionTokens);
 
-      actualTokensUsed = totalTokens;
+      const rateMultiplier = selectedKey?.rate ?? 1.0;
+      actualTokensUsed = Math.round(totalTokens * rateMultiplier);
       cachedTokensUsed = cachedTokens;
       finalStatusCode = 200;
 
@@ -1006,6 +1016,8 @@ export class ProxyService {
         completionTokens,
         cachedTokens,
         totalTokens,
+        deductedTokens: actualTokensUsed,
+        rateMultiplier,
         requestDurationMs: Date.now() - startTime,
         statusCode: 200,
         isStream: false,
@@ -1345,7 +1357,8 @@ export class ProxyService {
         }
 
         const totalTokens = Math.min(inputTokens + outputTokens, maxAllowedTokens);
-        actualTokensUsed = totalTokens;
+        const rateMultiplier = selectedKey?.rate ?? 1.0;
+        actualTokensUsed = Math.round(totalTokens * rateMultiplier);
         cachedTokensUsed = cachedTokens;
         finalStatusCode = streamAborted ? 499 : 200;
 
@@ -1357,6 +1370,8 @@ export class ProxyService {
           completionTokens: outputTokens,
           cachedTokens,
           totalTokens,
+          deductedTokens: actualTokensUsed,
+          rateMultiplier,
           requestDurationMs: Date.now() - startTime,
           statusCode: finalStatusCode,
           isStream: true,
@@ -1445,7 +1460,8 @@ export class ProxyService {
       const cachedTokens = usage.cache_read_input_tokens ?? 0;
       const totalTokens = Math.min(inputTokens + outputTokens, maxAllowedTokens);
 
-      actualTokensUsed = totalTokens;
+      const rateMultiplier = selectedKey?.rate ?? 1.0;
+      actualTokensUsed = Math.round(totalTokens * rateMultiplier);
       cachedTokensUsed = cachedTokens;
       finalStatusCode = 200;
 
@@ -1457,6 +1473,8 @@ export class ProxyService {
         completionTokens: outputTokens,
         cachedTokens,
         totalTokens,
+        deductedTokens: actualTokensUsed,
+        rateMultiplier,
         requestDurationMs: Date.now() - startTime,
         statusCode: 200,
         isStream: false,
