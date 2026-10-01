@@ -15,8 +15,10 @@ export class GatewayRateLimiter {
         const client = new Redis(config.REDIS_URL, {
           lazyConnect: true,
           enableOfflineQueue: false,
-          maxRetriesPerRequest: 1
+          maxRetriesPerRequest: 1,
+          retryStrategy: () => null // Do not spam retries if Redis is unavailable
         });
+        client.on('error', () => {}); // Silent catch for offline Redis
         client.connect().then(() => {
           this.redisClient = client;
           console.log('[RateLimiter] Connected to Redis for distributed rate limiting');
