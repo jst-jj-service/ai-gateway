@@ -342,6 +342,44 @@ export async function runProxyIntegrationTests() {
   });
   assert.strictEqual(overflowKeyRes.statusCode, 400, 'Exceeding 20 API keys must be rejected');
 
+  // 26. Test /v1/messages and /messages without auth -> Expect 401
+  const unauthMessagesRes = await app.inject({
+    method: 'POST',
+    url: '/v1/messages',
+    payload: {
+      model: 'claude-3-7-sonnet-20250219',
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+  assert.strictEqual(unauthMessagesRes.statusCode, 401);
+
+  // 27. Test /v1/messages with x-api-key header and invalid payload (empty messages) -> Expect 400
+  const invalidMessagesRes = await app.inject({
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { 'x-api-key': userRawApiKey },
+    payload: {
+      model: 'claude-3-7-sonnet-20250219',
+      messages: []
+    }
+  });
+  assert.strictEqual(invalidMessagesRes.statusCode, 400);
+
+  // 28. Test /v1/models returns complete model catalog across all 6 pools
+  const modelsRes = await app.inject({
+    method: 'GET',
+    url: '/v1/models',
+    headers: { Authorization: `Bearer ${userRawApiKey}` }
+  });
+  assert.strictEqual(modelsRes.statusCode, 200);
+  const modelsJson = JSON.parse(modelsRes.body);
+  assert.ok(Array.isArray(modelsJson.data));
+  const modelIds = modelsJson.data.map((m: any) => m.id);
+  assert.ok(modelIds.includes('gpt-6-astra'));
+  assert.ok(modelIds.includes('gpt-5.6-sol'));
+  assert.ok(modelIds.includes('claude-3-7-sonnet-20250219'));
+  assert.ok(modelIds.includes('claude-opus-5'));
+
   await app.close();
-  console.log('✓ Fastify Integration & /v1/responses tests passed successfully!');
+  console.log('✓ Fastify Integration, /v1/responses & /v1/messages tests passed successfully!');
 }
