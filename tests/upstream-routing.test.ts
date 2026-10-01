@@ -66,19 +66,26 @@ export async function runUpstreamRoutingTests() {
   assert.strictEqual(chatGptKey?.name, 'GPT016');
   assert.strictEqual(chatGptKey?.rate, 0.325);
 
-  // Test 10: Sol reasoning routing (GPT020 @ 0.45x)
+  // Test 10: Sol frontier model routes to cheapest key by default (GPT007 @ 0.1625x)
   const solKey = selectKeyForModel('sol');
   assert.ok(solKey);
-  assert.strictEqual(solKey?.name, 'GPT020');
-  assert.strictEqual(solKey?.rate, 0.45);
+  assert.strictEqual(solKey?.name, 'GPT007');
+  assert.strictEqual(solKey?.rate, 0.1625);
 
-  // Test 11: Astra flagship routing (GPT030 @ 0.45x)
-  const astraKey = selectKeyForModel('astra');
-  assert.ok(astraKey);
-  assert.strictEqual(astraKey?.name, 'GPT030');
-  assert.strictEqual(astraKey?.rate, 0.45);
+  // Test 11: Sol with stable tag routes to High-Stability tier (GPT020 @ 0.45x)
+  const solStableKey = selectKeyForModel('sol:stable');
+  assert.ok(solStableKey);
+  assert.strictEqual(solStableKey?.name, 'GPT020');
+  assert.strictEqual(solStableKey?.stability, 'high_stability');
+  assert.strictEqual(solStableKey?.rate, 0.45);
 
-  // Test 12: Flagship realtime routing (GPT030 @ 0.45x)
+  // Test 12: Astra flagship routing with stable tag
+  const astraStableKey = selectKeyForModel('astra:stable');
+  assert.ok(astraStableKey);
+  assert.strictEqual(astraStableKey?.stability, 'high_stability');
+  assert.strictEqual(astraStableKey?.rate, 0.45);
+
+  // Test 13: Flagship realtime routing (GPT030 @ 0.45x)
   const realtimeKey = selectKeyForModel('gpt-4o-realtime-preview');
   assert.ok(realtimeKey);
   assert.strictEqual(realtimeKey?.name, 'GPT030');
