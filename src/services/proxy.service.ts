@@ -54,6 +54,29 @@ function estimateCompletionTokens(content: unknown): number {
   return Math.max(1, Math.ceil(content.length / 3.5));
 }
 
+function estimateAnthropicTokens(body: Record<string, unknown>): number {
+  let chars = 0;
+  if (typeof body.system === 'string') {
+    chars += body.system.length;
+  } else if (Array.isArray(body.system)) {
+    for (const part of body.system) {
+      if (typeof part?.text === 'string') chars += part.text.length;
+    }
+  }
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages as any[]) {
+      if (typeof msg?.content === 'string') {
+        chars += msg.content.length;
+      } else if (Array.isArray(msg?.content)) {
+        for (const part of msg.content) {
+          if (typeof part?.text === 'string') chars += part.text.length;
+        }
+      }
+    }
+  }
+  return Math.max(8, Math.ceil(chars / 3.5));
+}
+
 export class ProxyService {
   constructor(
     private config: Config,
@@ -965,49 +988,493 @@ export class ProxyService {
   }
 
   /**
-   * Proxies simple GET endpoints like /v1/models.
+   * Proxies /v1/messages and /messages to upstream Anthropic endpoint.
+   * Fully supports Anthropic SDKs, Claude Code, and direct Claude Messages API calls.
+   * Intercepts errors and streams/responses to ensure error sanitization:
+   * 1. Never leaks upstream keys, endpoints, or error details.
+   * 2. Never leaks user prompt messages in errors.
+   * 3. Prevents concurrency race conditions via optimistic reservation and post-response reconciliation.
    */
-  public async handleGetModels(reply: FastifyReply) {
-    const upstreamUrl = `${this.config.UPSTREAM_BASE_URL.replace(/\/$/, '')}/v1/models`;
-    const upstreamHeaders: Record<string, string> = {};
+  public async handleMessages(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    user: AuthenticatedUser
+  ) {
+    const startTime = Date.now();
+    const body = (req.body as Record<string, unknown>) || {};
 
-    const firstKey = this.config.UPSTREAM_KEYS?.[0];
-    const effectiveApiKey = this.config.UPSTREAM_API_KEY || (firstKey ? firstKey.apiKey : '');
-    if (effectiveApiKey) {
-      upstreamHeaders['Authorization'] = `Bearer ${effectiveApiKey}`;
+    if (!body || typeof body !== 'object') {
+      return reply.code(400).send({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'Invalid request body. JSON object expected.'
+        }
+      });
     }
 
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return reply.code(400).send({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'Invalid request: "messages" must be a non-empty array.'
+        }
+      });
+    }
+
+    const isStream = body.stream === true || body.stream === 'true';
+    const model = (body.model as string) || 'claude-3-7-sonnet-20250219';
+
+    // Validate max_tokens
+    let requestedMaxTokens = 4096;
+    if (typeof body.max_tokens === 'number') {
+      if (!Number.isFinite(body.max_tokens) || body.max_tokens < 1) {
+        return reply.code(400).send({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'Invalid max_tokens parameter: must be a positive integer.'
+          }
+        });
+      }
+      requestedMaxTokens = Math.floor(body.max_tokens);
+    }
+
+    // Estimate token reservation budget
+    const promptTokensEst = estimateAnthropicTokens(body);
+    const quota = await this.quotaService.getQuota(user.id);
+    const remaining = Number(quota.remainingTokens);
+
+    const MIN_COMPLETION_TOKENS = 8;
+    if (remaining < promptTokensEst + MIN_COMPLETION_TOKENS) {
+      const quotaErr = ErrorSanitizerService.quotaExhaustedError(this.config.NEXT_PUBLIC_SHOP_URL);
+      return reply.code(quotaErr.statusCode).send({
+        type: 'error',
+        error: {
+          type: 'quota_exhausted_error',
+          message: quotaErr.payload.error.message,
+          suggestion: quotaErr.payload.error.suggestion
+        }
+      });
+    }
+
+    const availableForCompletion = remaining - promptTokensEst;
+    const cappedCompletionTokens = Math.min(requestedMaxTokens, availableForCompletion);
+
+    const reservationBudget = promptTokensEst + cappedCompletionTokens;
+    const minRequired = promptTokensEst + MIN_COMPLETION_TOKENS;
+
+    const reservation = await this.quotaService.reserveQuota(user.id, reservationBudget, minRequired);
+    if (!reservation.success) {
+      const quotaErr = ErrorSanitizerService.quotaExhaustedError(this.config.NEXT_PUBLIC_SHOP_URL);
+      return reply.code(quotaErr.statusCode).send({
+        type: 'error',
+        error: {
+          type: 'quota_exhausted_error',
+          message: quotaErr.payload.error.message,
+          suggestion: quotaErr.payload.error.suggestion
+        }
+      });
+    }
+
+    const maxAllowedTokens = reservation.reservedTokens;
+    const upstreamMaxCompletion = Math.min(
+      cappedCompletionTokens,
+      Math.max(1, maxAllowedTokens - promptTokensEst)
+    );
+
+    let actualTokensUsed = 0;
+    let cachedTokensUsed = 0;
+    let finalStatusCode = 500;
+
+    const upstreamUrl = `${this.config.UPSTREAM_BASE_URL.replace(/\/$/, '')}/v1/messages`;
+    const upstreamHeaders: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+
+    if (isStream) {
+      upstreamHeaders['Accept'] = 'text/event-stream';
+    }
+
+    const selectedKey = selectKeyForModel(model, this.config.UPSTREAM_KEYS, this.config.UPSTREAM_API_KEY);
+    const effectiveApiKey = selectedKey ? selectedKey.apiKey : this.config.UPSTREAM_API_KEY;
+    if (!effectiveApiKey) {
+      return reply.code(400).send({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: `The requested model '${model}' is not supported by any configured upstream tier, and no fallback API key is configured.`
+        }
+      });
+    }
+
+    upstreamHeaders['x-api-key'] = effectiveApiKey;
+    upstreamHeaders['anthropic-version'] = String(req.headers['anthropic-version'] || '2023-06-01');
+    if (req.headers['anthropic-beta']) {
+      upstreamHeaders['anthropic-beta'] = String(req.headers['anthropic-beta']);
+    }
+
+    const proxyBody = { ...body };
+    proxyBody.max_tokens = upstreamMaxCompletion;
+
+    const abortController = new AbortController();
+    const onClose = () => {
+      abortController.abort();
+    };
+    req.raw.on('close', onClose);
+
     try {
-      const res = await undiciRequest(upstreamUrl, {
-        method: 'GET',
+      const upstreamResponse = await undiciRequest(upstreamUrl, {
+        method: 'POST',
         headers: upstreamHeaders,
-        headersTimeout: 15000
+        body: JSON.stringify(proxyBody),
+        headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+        bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+        signal: abortController.signal
       });
 
-      if (res.statusCode !== 200) {
-        return reply.code(200).send({
-          object: 'list',
-          data: [
-            { id: 'gpt-4o', object: 'model', created: 1715368132, owned_by: 'system' },
-            { id: 'gpt-4o-mini', object: 'model', created: 1721172741, owned_by: 'system' },
-            { id: 'claude-3-5-sonnet-20241022', object: 'model', created: 1729600000, owned_by: 'system' },
-            { id: 'deepseek-chat', object: 'model', created: 1700000000, owned_by: 'system' },
-            { id: 'text-embedding-3-small', object: 'model', created: 1705948997, owned_by: 'system' }
-          ]
+      const statusCode = upstreamResponse.statusCode;
+      finalStatusCode = statusCode;
+
+      if (statusCode < 200 || statusCode >= 300) {
+        let rawErrorBody = '';
+        try {
+          rawErrorBody = await upstreamResponse.body.text();
+        } catch {
+          // ignore
+        }
+
+        const sanitized = ErrorSanitizerService.sanitize(
+          statusCode,
+          `Upstream Messages returned HTTP ${statusCode} for model ${model}: ${rawErrorBody}`
+        );
+
+        actualTokensUsed = 0;
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens: 0,
+          requestDurationMs: Date.now() - startTime,
+          statusCode,
+          isStream,
+          skipQuotaDeduct: true,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return reply.code(sanitized.statusCode).send({
+          type: 'error',
+          error: {
+            type: sanitized.payload.error.type || 'api_error',
+            message: sanitized.payload.error.message
+          }
         });
       }
 
-      const body = await res.body.json();
-      return reply.code(200).send(body);
-    } catch {
-      return reply.code(200).send({
-        object: 'list',
-        data: [
-          { id: 'gpt-4o', object: 'model', created: 1715368132, owned_by: 'system' },
-          { id: 'gpt-4o-mini', object: 'model', created: 1721172741, owned_by: 'system' },
-          { id: 'text-embedding-3-small', object: 'model', created: 1705948997, owned_by: 'system' }
-        ]
+      if (isStream) {
+        reply.raw.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no'
+        });
+
+        let sseBuffer = '';
+        let inputTokens = promptTokensEst;
+        let outputTokens = 0;
+        let cachedTokens = 0;
+        let streamAborted = false;
+
+        try {
+          for await (const chunk of upstreamResponse.body) {
+            if (req.raw.destroyed) {
+              streamAborted = true;
+              break;
+            }
+
+            const chunkStr = chunk.toString();
+            sseBuffer += chunkStr;
+
+            const parts = sseBuffer.split('\n\n');
+            sseBuffer = parts.pop() || '';
+
+            for (const part of parts) {
+              if (!part.trim()) continue;
+
+              const lines = part.split('\n');
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const dataStr = line.slice(6).trim();
+                  if (dataStr && dataStr !== '[DONE]') {
+                    try {
+                      const dataJson = JSON.parse(dataStr);
+                      if (dataJson.type === 'message_start' && dataJson.message?.usage) {
+                        if (typeof dataJson.message.usage.input_tokens === 'number') {
+                          inputTokens = dataJson.message.usage.input_tokens;
+                        }
+                        if (typeof dataJson.message.usage.cache_read_input_tokens === 'number') {
+                          cachedTokens = dataJson.message.usage.cache_read_input_tokens;
+                        }
+                      } else if (dataJson.type === 'content_block_delta') {
+                        const deltaText = dataJson.delta?.text || '';
+                        if (deltaText) {
+                          outputTokens += Math.max(1, Math.ceil(deltaText.length / 3.5));
+                        }
+                      } else if (dataJson.type === 'message_delta') {
+                        if (typeof dataJson.usage?.output_tokens === 'number') {
+                          outputTokens = dataJson.usage.output_tokens;
+                        }
+                      }
+                    } catch {
+                      // ignore parse errors
+                    }
+                  }
+                }
+              }
+
+              const sanitizedBlock = ErrorSanitizerService.scrubSensitiveText(part) + '\n\n';
+              reply.raw.write(sanitizedBlock);
+            }
+          }
+
+          if (sseBuffer.trim()) {
+            reply.raw.write(ErrorSanitizerService.scrubSensitiveText(sseBuffer) + '\n\n');
+          }
+        } finally {
+          reply.raw.end();
+        }
+
+        const totalTokens = Math.min(inputTokens + outputTokens, maxAllowedTokens);
+        actualTokensUsed = totalTokens;
+        cachedTokensUsed = cachedTokens;
+        finalStatusCode = streamAborted ? 499 : 200;
+
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: inputTokens,
+          completionTokens: outputTokens,
+          cachedTokens,
+          totalTokens,
+          requestDurationMs: Date.now() - startTime,
+          statusCode: finalStatusCode,
+          isStream: true,
+          skipQuotaDeduct: true,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return;
+      }
+
+      // Non-streaming JSON response
+      const responseText = await upstreamResponse.body.text();
+      let responseJson: Record<string, unknown>;
+
+      try {
+        responseJson = JSON.parse(responseText);
+      } catch {
+        const sanitized = ErrorSanitizerService.sanitize(502, 'Upstream Messages returned invalid JSON');
+        actualTokensUsed = 0;
+        return reply.code(sanitized.statusCode).send({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: sanitized.payload.error.message
+          }
+        });
+      }
+
+      if (responseJson.type === 'error' || responseJson.error) {
+        const sanitized = ErrorSanitizerService.sanitize(
+          502,
+          `Upstream Messages returned error: ${JSON.stringify(responseJson.error || responseJson)}`
+        );
+        actualTokensUsed = 0;
+        finalStatusCode = 502;
+
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens: 0,
+          requestDurationMs: Date.now() - startTime,
+          statusCode: 502,
+          isStream: false,
+          skipQuotaDeduct: true,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return reply.code(sanitized.statusCode).send({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: sanitized.payload.error.message
+          }
+        });
+      }
+
+      const usage = (responseJson.usage || {}) as {
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_creation_input_tokens?: number;
+        cache_read_input_tokens?: number;
+      };
+
+      const inputTokens = usage.input_tokens ?? promptTokensEst;
+      let outputTokens = usage.output_tokens ?? 0;
+      if (outputTokens === 0 && Array.isArray(responseJson.content)) {
+        for (const block of responseJson.content as any[]) {
+          if (typeof block?.text === 'string') {
+            outputTokens += Math.max(1, Math.ceil(block.text.length / 3.5));
+          }
+        }
+      }
+      const cachedTokens = usage.cache_read_input_tokens ?? 0;
+      const totalTokens = Math.min(inputTokens + outputTokens, maxAllowedTokens);
+
+      actualTokensUsed = totalTokens;
+      cachedTokensUsed = cachedTokens;
+      finalStatusCode = 200;
+
+      await this.usageService.recordApiUsage({
+        userId: user.id,
+        apiKeyId: user.apiKeyId,
+        model,
+        promptTokens: inputTokens,
+        completionTokens: outputTokens,
+        cachedTokens,
+        totalTokens,
+        requestDurationMs: Date.now() - startTime,
+        statusCode: 200,
+        isStream: false,
+        skipQuotaDeduct: true,
+        upstreamGroup: selectedKey?.group,
+        upstreamKeyName: selectedKey?.name
       });
+
+      return reply.code(200).send(responseJson);
+    } catch (networkOrTimeoutError) {
+      const sanitized = ErrorSanitizerService.sanitize(
+        networkOrTimeoutError,
+        `Network or timeout calling upstream Messages: ${upstreamUrl}`
+      );
+      actualTokensUsed = 0;
+      finalStatusCode = sanitized.statusCode;
+
+      await this.usageService.recordApiUsage({
+        userId: user.id,
+        apiKeyId: user.apiKeyId,
+        model,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        requestDurationMs: Date.now() - startTime,
+        statusCode: sanitized.statusCode,
+        isStream,
+        skipQuotaDeduct: true,
+        upstreamGroup: selectedKey?.group,
+        upstreamKeyName: selectedKey?.name
+      });
+
+      return reply.code(sanitized.statusCode).send({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: sanitized.payload.error.message
+        }
+      });
+    } finally {
+      req.raw.off('close', onClose);
+      await this.quotaService.reconcileQuota(
+        user.id,
+        reservation.reservationId,
+        actualTokensUsed,
+        cachedTokensUsed,
+        finalStatusCode
+      );
     }
+  }
+
+  /**
+   * Proxies simple GET endpoints like /v1/models with full catalog across all 6 pools.
+   */
+  public async handleGetModels(reply: FastifyReply) {
+    const models = [
+      // Flagship / Astra
+      { id: 'gpt-6-astra', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'astra', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-6', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-6-luna', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'o1', object: 'model', created: 1734000000, owned_by: 'system' },
+      { id: 'o1-2024-12-17', object: 'model', created: 1734000000, owned_by: 'system' },
+      { id: 'o3-mini', object: 'model', created: 1738000000, owned_by: 'system' },
+      { id: 'gpt-4o-realtime-preview', object: 'model', created: 1727000000, owned_by: 'system' },
+
+      // Pro / Sol
+      { id: 'gpt-5.6-sol', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'sol', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-5.6-terra', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'terra', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-5.6-luna', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-6-sol', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-6.1-sol', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'o1-mini', object: 'model', created: 1726000000, owned_by: 'system' },
+      { id: 'o1-preview', object: 'model', created: 1726000000, owned_by: 'system' },
+
+      // Plus
+      { id: 'gpt-4o', object: 'model', created: 1715368132, owned_by: 'system' },
+      { id: 'chatgpt-4o-latest', object: 'model', created: 1723000000, owned_by: 'system' },
+      { id: 'gpt-5.6', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-5.2', object: 'model', created: 1738000000, owned_by: 'system' },
+      { id: 'gpt-5.2-chat-latest', object: 'model', created: 1738000000, owned_by: 'system' },
+      { id: 'gpt-5.4-2026-03-05', object: 'model', created: 1741000000, owned_by: 'system' },
+
+      // Starter
+      { id: 'gpt-4o-mini', object: 'model', created: 1721172741, owned_by: 'system' },
+      { id: 'gpt-5.4-mini', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-5.5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'gpt-5.4', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'codex-auto-review', object: 'model', created: 1738000000, owned_by: 'system' },
+      { id: 'gpt-5.3-codex-spark', object: 'model', created: 1738000000, owned_by: 'system' },
+
+      // Claude Standard
+      { id: 'claude-fable-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'fable', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-fable-5-1', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-opus-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-opus-5-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-sonnet-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-sonnet-4-6', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-sonnet-4-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-haiku-4-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-3-5-haiku-20241022', object: 'model', created: 1729600000, owned_by: 'system' },
+
+      // Claude Max
+      { id: 'claude-3-7-sonnet-20250219', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-3.7-sonnet', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-3-5-sonnet-20241022', object: 'model', created: 1729600000, owned_by: 'system' },
+      { id: 'claude-3.5-sonnet', object: 'model', created: 1729600000, owned_by: 'system' },
+      { id: 'claude-3-5-sonnet-20240620', object: 'model', created: 1718800000, owned_by: 'system' },
+      { id: 'claude-sonnet-5-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-opus-4-5', object: 'model', created: 1740000000, owned_by: 'system' },
+      { id: 'claude-max', object: 'model', created: 1740000000, owned_by: 'system' }
+    ];
+
+    return reply.code(200).send({
+      object: 'list',
+      data: models
+    });
   }
 }
