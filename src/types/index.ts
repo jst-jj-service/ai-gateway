@@ -59,6 +59,8 @@ export interface UsageRecord {
   completionTokens: number;
   cachedTokens: number;
   totalTokens: number;
+  deductedTokens?: number;
+  rateMultiplier?: number;
   requestDurationMs: number;
   statusCode: number;
   isStream: boolean;
