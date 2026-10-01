@@ -1535,6 +1535,123 @@ export class ProxyService {
   }
 
   /**
+   * Proxies POST /v1/embeddings requests to upstream OpenAI compatible provider with rate multiplier quota deduction.
+   */
+  public async handleEmbeddings(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    user: AuthenticatedUser
+  ) {
+    const startTime = Date.now();
+    const body = (req.body as Record<string, any>) || {};
+    const rawModel = typeof body.model === 'string' ? body.model : 'text-embedding-3-small';
+    const { cleanModel } = parseModelAndPoolPreference(rawModel);
+    const model = normalizeModelAlias(cleanModel);
+
+    // Estimate input tokens (string or array of strings)
+    let promptChars = 0;
+    if (typeof body.input === 'string') {
+      promptChars = body.input.length;
+    } else if (Array.isArray(body.input)) {
+      for (const item of body.input) {
+        if (typeof item === 'string') promptChars += item.length;
+      }
+    }
+    const estimatedTokens = Math.max(8, Math.ceil(promptChars / 3.5));
+
+    // Select key (default to GPT016 / Plus pool which supports embeddings)
+    const preferredPool = req.headers['x-pool-preference'] as string | undefined;
+    const candidateKeys = getOrderedKeysForModel(model, this.config.UPSTREAM_KEYS, preferredPool, this.config.UPSTREAM_API_KEY);
+    const selectedKey = candidateKeys.length > 0 ? candidateKeys[0] : null;
+    const activeApiKey = selectedKey?.apiKey || this.config.UPSTREAM_API_KEY;
+    const rateMultiplier = selectedKey?.rate ?? 0.325;
+
+    // Reserve quota
+    const reservation = await this.quotaService.reserveQuota(user.id, Math.round(estimatedTokens * rateMultiplier), 1);
+    if (!reservation.success) {
+      const quotaErr = ErrorSanitizerService.quotaExhaustedError(this.config.NEXT_PUBLIC_SHOP_URL);
+      return reply.code(quotaErr.statusCode).send(quotaErr.payload);
+    }
+
+    let actualTokensUsed = 0;
+    let finalStatusCode = 500;
+
+    try {
+      const upstreamUrl = `${this.config.UPSTREAM_BASE_URL}/v1/embeddings`;
+      const modifiedBody = { ...body, model };
+
+      const upstreamRes = await undiciRequest(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${activeApiKey}`
+        },
+        body: JSON.stringify(modifiedBody),
+        headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+        bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS
+      });
+
+      finalStatusCode = upstreamRes.statusCode;
+
+      if (upstreamRes.statusCode === 200) {
+        const responseData = (await upstreamRes.body.json()) as any;
+        const totalTokens = responseData?.usage?.total_tokens || responseData?.usage?.prompt_tokens || estimatedTokens;
+        actualTokensUsed = Math.round(totalTokens * rateMultiplier);
+
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: totalTokens,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens,
+          deductedTokens: actualTokensUsed,
+          rateMultiplier,
+          requestDurationMs: Date.now() - startTime,
+          statusCode: 200,
+          isStream: false,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return reply.code(200).send(responseData);
+      } else {
+        const errText = await upstreamRes.body.text();
+        const sanitized = ErrorSanitizerService.sanitizeError(errText, upstreamRes.statusCode);
+
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens: 0,
+          deductedTokens: 0,
+          rateMultiplier,
+          requestDurationMs: Date.now() - startTime,
+          statusCode: sanitized.statusCode,
+          isStream: false,
+          skipQuotaDeduct: true,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return reply.code(sanitized.statusCode).send(sanitized.payload);
+      }
+    } finally {
+      await this.quotaService.reconcileQuota(
+        user.id,
+        reservation.reservationId,
+        actualTokensUsed,
+        0,
+        finalStatusCode
+      );
+    }
+  }
+
+  /**
    * Proxies simple GET endpoints like /v1/models with full catalog across all 6 pools.
    */
   public async handleGetModels(reply: FastifyReply) {
