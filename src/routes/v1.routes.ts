@@ -37,7 +37,18 @@ export async function v1Routes(
     const hasQuota = await quotaService.hasRemainingQuota(req.user.id, 1);
     if (!hasQuota) {
       const quotaErr = ErrorSanitizerService.quotaExhaustedError(config.NEXT_PUBLIC_SHOP_URL);
-      reply.code(quotaErr.statusCode).send(quotaErr.payload);
+      if (req.url.includes('/messages')) {
+        reply.code(quotaErr.statusCode).send({
+          type: 'error',
+          error: {
+            type: 'quota_exhausted_error',
+            message: quotaErr.payload.error.message,
+            suggestion: quotaErr.payload.error.suggestion
+          }
+        });
+      } else {
+        reply.code(quotaErr.statusCode).send(quotaErr.payload);
+      }
       return false;
     }
 
@@ -58,6 +69,22 @@ export async function v1Routes(
     if (!passed) return;
 
     return proxyService.handleResponses(req, reply, req.user!);
+  });
+
+  // POST /v1/messages (Anthropic Messages API compatible for Claude Code & Anthropic SDKs)
+  fastify.post('/v1/messages', async (req, reply) => {
+    const passed = await proxyPreHandler(req, reply);
+    if (!passed) return;
+
+    return proxyService.handleMessages(req, reply, req.user!);
+  });
+
+  // POST /messages (Direct route for clients pointing BASE_URL to /v1 or root)
+  fastify.post('/messages', async (req, reply) => {
+    const passed = await proxyPreHandler(req, reply);
+    if (!passed) return;
+
+    return proxyService.handleMessages(req, reply, req.user!);
   });
 
   // GET /v1/models
