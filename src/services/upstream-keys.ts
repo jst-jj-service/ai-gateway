@@ -3,7 +3,7 @@ export interface UpstreamKey {
   apiKey: string;
   group: string;
   rate: number;
-  stability: 'economy' | 'standard' | 'high_stability';
+  stability?: 'starter' | 'standard' | 'high_stability';
   models: string[];
 }
 
@@ -13,7 +13,7 @@ export const DEFAULT_UPSTREAM_KEYS: UpstreamKey[] = [
     apiKey: 'sk-d0db48ab1df2eff985afb32c3c7f12e86b1c12ffa653fbf187944830053b0ce6',
     group: 'GPT Starter | 0.16x',
     rate: 0.1625,
-    stability: 'economy',
+    stability: 'starter',
     models: [
       'gpt-4o-mini',
       'gpt-5.4-mini',
@@ -126,9 +126,9 @@ export const DEFAULT_UPSTREAM_KEYS: UpstreamKey[] = [
   {
     name: 'Claude0.13',
     apiKey: 'sk-531091eb31daa8d83752916b32e4cd0bf01158a037f9d5cbd4a0c684c101c406',
-    group: 'Claude Standard | 0.24x',
+    group: 'Claude Opus 5 | 0.24x',
     rate: 0.24,
-    stability: 'economy',
+    stability: 'standard',
     models: [
       'fable',
       'claude-fable',
@@ -219,7 +219,7 @@ export function stripDateSuffix(model: string): string {
 }
 
 /**
- * Parses model name and optional pool preference (e.g. "astra:stable", "sol:economy", "gpt-4o:plus").
+ * Parses model name and optional pool preference (e.g. "astra:vip", "sol:pro", "gpt-4o:plus").
  */
 export function parseModelAndPoolPreference(rawModel: string): { cleanModel: string; preferredPool?: string } {
   if (!rawModel) return { cleanModel: '' };
@@ -228,7 +228,7 @@ export function parseModelAndPoolPreference(rawModel: string): { cleanModel: str
   if (parts.length === 2) {
     const base = parts[0].trim();
     const tag = parts[1].trim().toLowerCase();
-    if (['stable', 'flagship', 'pro', 'plus', 'economy', 'starter', 'max', 'standard'].includes(tag)) {
+    if (['stable', 'flagship', 'pro', 'plus', 'vip', 'starter', 'welfare', 'max', 'standard', 'opus'].includes(tag)) {
       return { cleanModel: base, preferredPool: tag };
     }
   }
