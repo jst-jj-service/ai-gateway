@@ -15,11 +15,32 @@ export class AuthPlugin {
    * Universal auth hook: validates either an API Key (`sk-gw-...`) or a JWT Bearer token.
    */
   public authenticate = async (req: FastifyRequest, reply: FastifyReply): Promise<boolean> => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
+    const xApiKey = req.headers['x-api-key'];
+    let token: string | undefined;
+
+    if (typeof xApiKey === 'string' && xApiKey.trim()) {
+      token = xApiKey.trim();
+    } else if (req.headers.authorization) {
+      const parts = req.headers.authorization.split(' ');
+      if (parts.length === 2 && parts[0] === 'Bearer') {
+        token = parts[1].trim();
+      } else {
+        reply.code(401).send({
+          error: {
+            message: 'Invalid Authorization header format. Expected "Bearer <token>".',
+            type: 'authentication_error',
+            code: 'invalid_token_format',
+            status: 401
+          }
+        });
+        return false;
+      }
+    }
+
+    if (!token) {
       reply.code(401).send({
         error: {
-          message: 'Missing Authorization header. Please provide an API key (Bearer sk-gw-...) or JWT token.',
+          message: 'Missing API key or Authorization header. Please provide an API key (Bearer sk-gw-... or x-api-key) or JWT token.',
           type: 'authentication_error',
           code: 'unauthorized',
           status: 401
@@ -27,21 +48,6 @@ export class AuthPlugin {
       });
       return false;
     }
-
-    const parts = authHeader.split(' ');
-    if (parts.length !== 2 || parts[0] !== 'Bearer') {
-      reply.code(401).send({
-        error: {
-          message: 'Invalid Authorization header format. Expected "Bearer <token>".',
-          type: 'authentication_error',
-          code: 'invalid_token_format',
-          status: 401
-        }
-      });
-      return false;
-    }
-
-    const token = parts[1].trim();
 
     // Check if it's an API Key (sk-gw-...)
     if (token.startsWith('sk-gw-')) {
