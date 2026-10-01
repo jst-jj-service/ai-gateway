@@ -12,6 +12,8 @@ export class UsageService {
     completionTokens: number;
     cachedTokens: number;
     totalTokens: number;
+    deductedTokens?: number;
+    rateMultiplier?: number;
     requestDurationMs: number;
     statusCode: number;
     isStream: boolean;
@@ -64,6 +66,9 @@ export class UsageService {
         cachedTokens: l.cachedTokens,
         totalTokens: l.totalTokens,
         totalTokensFormatted: formatTokens(l.totalTokens),
+        deductedTokens: l.deductedTokens ?? l.totalTokens,
+        deductedTokensFormatted: formatTokens(l.deductedTokens ?? l.totalTokens),
+        rateMultiplier: l.rateMultiplier,
         requestDurationMs: l.requestDurationMs,
         statusCode: l.statusCode,
         isStream: l.isStream,
