@@ -6,7 +6,7 @@ import { QuotaService } from './quota.service';
 import { ErrorSanitizerService } from './error-sanitizer.service';
 import { SseStreamParser } from '../utils/sse-parser';
 import { AuthenticatedUser } from '../types';
-import { selectKeyForModel } from './upstream-keys';
+import { selectKeyForModel, getOrderedKeysForModel, parseModelAndPoolPreference, normalizeModelAlias, UpstreamKey } from './upstream-keys';
 
 function estimatePromptTokens(messages: unknown): number {
   if (!Array.isArray(messages)) return 10;
@@ -193,9 +193,11 @@ export class ProxyService {
       upstreamHeaders['Accept'] = 'text/event-stream';
     }
 
-    const selectedKey = selectKeyForModel(model, this.config.UPSTREAM_KEYS, this.config.UPSTREAM_API_KEY);
-    const effectiveApiKey = selectedKey ? selectedKey.apiKey : this.config.UPSTREAM_API_KEY;
-    if (!effectiveApiKey) {
+    const headerPool = (req.headers['x-channel-preference'] || req.headers['x-pool-preference'] || req.headers['x-model-group'] || req.headers['x-stability-preference']) as string | undefined;
+    const { cleanModel } = parseModelAndPoolPreference(model);
+    const candidateKeys = getOrderedKeysForModel(model, this.config.UPSTREAM_KEYS, headerPool, this.config.UPSTREAM_API_KEY);
+
+    if (candidateKeys.length === 0) {
       return reply.code(400).send({
         error: {
           message: `The requested model '${model}' is not supported by any configured upstream tier, and no fallback API key is configured.`,
@@ -205,8 +207,6 @@ export class ProxyService {
         }
       });
     }
-
-    upstreamHeaders['Authorization'] = `Bearer ${effectiveApiKey}`;
 
     if (req.headers['openai-organization']) {
       upstreamHeaders['openai-organization'] = String(req.headers['openai-organization']);
@@ -218,6 +218,7 @@ export class ProxyService {
 
     // Ensure upstream provides token usage details in streaming mode, and cap max_tokens to prevent free usage
     const proxyBody = { ...body };
+    proxyBody.model = cleanModel;
     if (typeof body.max_completion_tokens === 'number') {
       proxyBody.max_completion_tokens = upstreamMaxCompletion;
     } else {
@@ -235,73 +236,251 @@ export class ProxyService {
     };
     req.raw.on('close', onClose);
 
+    let selectedKey: UpstreamKey | null = null;
+
     try {
-      const upstreamResponse = await undiciRequest(upstreamUrl, {
-        method: 'POST',
-        headers: upstreamHeaders,
-        body: JSON.stringify(proxyBody),
-        headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
-        bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
-        signal: abortController.signal
-      });
+      for (let keyIdx = 0; keyIdx < candidateKeys.length; keyIdx++) {
+      selectedKey = candidateKeys[keyIdx];
+      const effectiveApiKey = selectedKey.apiKey;
+      const isLastAttempt = keyIdx === candidateKeys.length - 1;
 
-      const statusCode = upstreamResponse.statusCode;
-      finalStatusCode = statusCode;
-      const contentType = String(upstreamResponse.headers['content-type'] || '');
+      const currentHeaders: Record<string, string> = {
+        ...upstreamHeaders,
+        'Authorization': `Bearer ${effectiveApiKey}`
+      };
 
-      // Handle upstream HTTP error status
-      if (statusCode < 200 || statusCode >= 300) {
-        let rawErrorBody = '';
-        try {
-          rawErrorBody = await upstreamResponse.body.text();
-        } catch {
-          // ignore
-        }
-
-        const sanitized = ErrorSanitizerService.sanitize(
-          statusCode,
-          `Upstream returned HTTP ${statusCode} for model ${model}: ${rawErrorBody}`
-        );
-
-        actualTokensUsed = 0;
-        await this.usageService.recordApiUsage({
-          userId: user.id,
-          apiKeyId: user.apiKeyId,
-          model,
-          promptTokens: 0,
-          completionTokens: 0,
-          cachedTokens: 0,
-          totalTokens: 0,
-          requestDurationMs: Date.now() - startTime,
-          statusCode,
-          isStream,
-          skipQuotaDeduct: true,
-          upstreamGroup: selectedKey?.group,
-          upstreamKeyName: selectedKey?.name
+      try {
+        const upstreamResponse = await undiciRequest(upstreamUrl, {
+          method: 'POST',
+          headers: currentHeaders,
+          body: JSON.stringify(proxyBody),
+          headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+          bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+          signal: abortController.signal
         });
 
-        return reply.code(sanitized.statusCode).send(sanitized.payload);
-      }
+        const statusCode = upstreamResponse.statusCode;
+        finalStatusCode = statusCode;
+        const contentType = String(upstreamResponse.headers['content-type'] || '');
 
-      // If client requested stream, but upstream returned JSON
-      if (isStream && contentType.includes('application/json')) {
+        // Channel offline / busy: failover on 5xx, 429, or 404 before sending headers to client
+        if ((statusCode >= 500 || statusCode === 429 || statusCode === 404) && !isLastAttempt && !req.raw.destroyed) {
+          try { await upstreamResponse.body.dump(); } catch {}
+          console.warn(`[ProxyService] Upstream channel ${selectedKey.name} (${selectedKey.group}) returned HTTP ${statusCode}. Auto-failing over to next tier...`);
+          continue;
+        }
+
+        // Handle upstream HTTP error status
+        if (statusCode < 200 || statusCode >= 300) {
+          let rawErrorBody = '';
+          try {
+            rawErrorBody = await upstreamResponse.body.text();
+          } catch {
+            // ignore
+          }
+
+          const sanitized = ErrorSanitizerService.sanitize(
+            statusCode,
+            `Upstream returned HTTP ${statusCode} for model ${cleanModel}: ${rawErrorBody}`
+          );
+
+          actualTokensUsed = 0;
+          await this.usageService.recordApiUsage({
+            userId: user.id,
+            apiKeyId: user.apiKeyId,
+            model,
+            promptTokens: 0,
+            completionTokens: 0,
+            cachedTokens: 0,
+            totalTokens: 0,
+            requestDurationMs: Date.now() - startTime,
+            statusCode,
+            isStream,
+            skipQuotaDeduct: true,
+            upstreamGroup: selectedKey?.group,
+            upstreamKeyName: selectedKey?.name
+          });
+
+          return reply.code(sanitized.statusCode).send(sanitized.payload);
+        }
+
+        // If client requested stream, but upstream returned JSON (potential error)
+        if (isStream && contentType.includes('application/json')) {
+          const responseText = await upstreamResponse.body.text();
+          let responseJson: Record<string, unknown>;
+          try {
+            responseJson = JSON.parse(responseText);
+          } catch {
+            if (!isLastAttempt && !req.raw.destroyed) {
+              continue;
+            }
+            const sanitized = ErrorSanitizerService.sanitize(502, 'Upstream returned invalid JSON');
+            actualTokensUsed = 0;
+            return reply.code(sanitized.statusCode).send(sanitized.payload);
+          }
+
+          if (responseJson.error) {
+            if (!isLastAttempt && !req.raw.destroyed) {
+              console.warn(`[ProxyService] Upstream channel ${selectedKey.name} returned JSON error in stream. Auto-failing over...`);
+              continue;
+            }
+            const sanitized = ErrorSanitizerService.sanitize(
+              502,
+              `Upstream JSON error in stream request: ${JSON.stringify(responseJson.error)}`
+            );
+            actualTokensUsed = 0;
+            finalStatusCode = 502;
+            await this.usageService.recordApiUsage({
+              userId: user.id,
+              apiKeyId: user.apiKeyId,
+              model,
+              promptTokens: 0,
+              completionTokens: 0,
+              cachedTokens: 0,
+              totalTokens: 0,
+              requestDurationMs: Date.now() - startTime,
+              statusCode: 502,
+              isStream: true,
+              skipQuotaDeduct: true,
+              upstreamGroup: selectedKey?.group,
+              upstreamKeyName: selectedKey?.name
+            });
+            return reply.code(sanitized.statusCode).send(sanitized.payload);
+          }
+
+          return reply.code(200).send(responseJson);
+        }
+
+        // Handle streaming SSE response
+        if (isStream) {
+          reply.raw.setHeader('Content-Type', 'text/event-stream');
+          reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
+          reply.raw.setHeader('Connection', 'keep-alive');
+          reply.raw.setHeader('X-Accel-Buffering', 'no');
+          reply.raw.writeHead(200);
+
+          const parser = new SseStreamParser();
+          let streamAborted = false;
+          let quotaCutoff = false;
+
+          try {
+            for await (const chunk of upstreamResponse.body) {
+              const { forwardChunk } = parser.feed(chunk);
+              if (forwardChunk) {
+                reply.raw.write(forwardChunk);
+              }
+
+              // Quota protection: monitor tokens during streaming and cut off upstream if reservation limit reached
+              const currentTotalTokens = promptTokensEst + parser.estimatedCompletionTokens;
+              if (currentTotalTokens >= maxAllowedTokens) {
+                quotaCutoff = true;
+                abortController.abort();
+                break;
+              }
+            }
+
+            const remaining = parser.flushRemaining();
+            if (remaining) {
+              reply.raw.write(remaining);
+            }
+          } catch (streamError) {
+            streamAborted = true;
+            if (!quotaCutoff) {
+              console.error('[ProxyService] Stream interrupted:', streamError);
+              const sanitizedEvent = ErrorSanitizerService.streamingErrorEvent();
+              reply.raw.write(sanitizedEvent);
+            }
+          } finally {
+            reply.raw.end();
+          }
+
+          // If stream encountered an error, aborted midway, or hit quota limit
+          if (parser.hasError || streamAborted || quotaCutoff) {
+            const partialCompletionTokens = Math.min(
+              parser.estimatedCompletionTokens,
+              Math.max(0, maxAllowedTokens - promptTokensEst)
+            );
+            const partialTokens = Math.min(promptTokensEst + partialCompletionTokens, maxAllowedTokens);
+            actualTokensUsed = partialTokens;
+            finalStatusCode = quotaCutoff ? 200 : 502;
+
+            await this.usageService.recordApiUsage({
+              userId: user.id,
+              apiKeyId: user.apiKeyId,
+              model,
+              promptTokens: promptTokensEst,
+              completionTokens: partialCompletionTokens,
+              cachedTokens: 0,
+              totalTokens: partialTokens,
+              requestDurationMs: Date.now() - startTime,
+              statusCode: finalStatusCode,
+              isStream: true,
+              skipQuotaDeduct: true,
+              upstreamGroup: selectedKey?.group,
+              upstreamKeyName: selectedKey?.name
+            });
+            return;
+          }
+
+          // Calculate final usage
+          const usage = parser.lastUsage;
+          const promptTokens = usage?.prompt_tokens ?? promptTokensEst;
+          const rawCompletionTokens = usage?.completion_tokens ?? parser.estimatedCompletionTokens;
+          const completionTokens = Math.min(rawCompletionTokens, Math.max(0, maxAllowedTokens - promptTokens));
+          const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+          const totalTokens = Math.min(usage?.total_tokens ?? (promptTokens + completionTokens), maxAllowedTokens);
+
+          actualTokensUsed = totalTokens;
+          cachedTokensUsed = cachedTokens;
+          finalStatusCode = 200;
+
+          await this.usageService.recordApiUsage({
+            userId: user.id,
+            apiKeyId: user.apiKeyId,
+            model,
+            promptTokens,
+            completionTokens,
+            cachedTokens,
+            totalTokens,
+            requestDurationMs: Date.now() - startTime,
+            statusCode: 200,
+            isStream: true,
+            skipQuotaDeduct: true,
+            upstreamGroup: selectedKey?.group,
+            upstreamKeyName: selectedKey?.name
+          });
+
+          return;
+        }
+
+        // Non-streaming JSON response
         const responseText = await upstreamResponse.body.text();
         let responseJson: Record<string, unknown>;
+
         try {
           responseJson = JSON.parse(responseText);
         } catch {
+          if (!isLastAttempt && !req.raw.destroyed) {
+            continue;
+          }
           const sanitized = ErrorSanitizerService.sanitize(502, 'Upstream returned invalid JSON');
           actualTokensUsed = 0;
           return reply.code(sanitized.statusCode).send(sanitized.payload);
         }
 
+        // Check if upstream returned an error object inside HTTP 200
         if (responseJson.error) {
+          if (!isLastAttempt && !req.raw.destroyed) {
+            console.warn(`[ProxyService] Upstream channel ${selectedKey.name} returned error in HTTP 200. Auto-failing over...`);
+            continue;
+          }
           const sanitized = ErrorSanitizerService.sanitize(
             502,
-            `Upstream JSON error in stream request: ${JSON.stringify(responseJson.error)}`
+            `Upstream returned error in HTTP 200: ${JSON.stringify(responseJson.error)}`
           );
           actualTokensUsed = 0;
           finalStatusCode = 502;
+
           await this.usageService.recordApiUsage({
             userId: user.id,
             apiKeyId: user.apiKeyId,
@@ -312,95 +491,31 @@ export class ProxyService {
             totalTokens: 0,
             requestDurationMs: Date.now() - startTime,
             statusCode: 502,
-            isStream: true,
+            isStream: false,
             skipQuotaDeduct: true,
             upstreamGroup: selectedKey?.group,
             upstreamKeyName: selectedKey?.name
           });
+
           return reply.code(sanitized.statusCode).send(sanitized.payload);
         }
 
-        return reply.code(200).send(responseJson);
-      }
+        // Extract token usage safely bounded by maxAllowedTokens
+        const usage = (responseJson.usage || {}) as {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+          prompt_tokens_details?: {
+            cached_tokens?: number;
+          };
+        };
 
-      // Handle streaming SSE response
-      if (isStream) {
-        reply.raw.setHeader('Content-Type', 'text/event-stream');
-        reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
-        reply.raw.setHeader('Connection', 'keep-alive');
-        reply.raw.setHeader('X-Accel-Buffering', 'no');
-        reply.raw.writeHead(200);
-
-        const parser = new SseStreamParser();
-        let streamAborted = false;
-        let quotaCutoff = false;
-
-        try {
-          for await (const chunk of upstreamResponse.body) {
-            const { forwardChunk } = parser.feed(chunk);
-            if (forwardChunk) {
-              reply.raw.write(forwardChunk);
-            }
-
-            // Quota protection: monitor tokens during streaming and cut off upstream if reservation limit reached
-            const currentTotalTokens = promptTokensEst + parser.estimatedCompletionTokens;
-            if (currentTotalTokens >= maxAllowedTokens) {
-              quotaCutoff = true;
-              abortController.abort();
-              break;
-            }
-          }
-
-          const remaining = parser.flushRemaining();
-          if (remaining) {
-            reply.raw.write(remaining);
-          }
-        } catch (streamError) {
-          streamAborted = true;
-          if (!quotaCutoff) {
-            console.error('[ProxyService] Stream interrupted:', streamError);
-            const sanitizedEvent = ErrorSanitizerService.streamingErrorEvent();
-            reply.raw.write(sanitizedEvent);
-          }
-        } finally {
-          reply.raw.end();
-        }
-
-        // If stream encountered an error, aborted midway, or hit quota limit
-        if (parser.hasError || streamAborted || quotaCutoff) {
-          const partialCompletionTokens = Math.min(
-            parser.estimatedCompletionTokens,
-            Math.max(0, maxAllowedTokens - promptTokensEst)
-          );
-          const partialTokens = Math.min(promptTokensEst + partialCompletionTokens, maxAllowedTokens);
-          actualTokensUsed = partialTokens;
-          finalStatusCode = quotaCutoff ? 200 : 502;
-
-          await this.usageService.recordApiUsage({
-            userId: user.id,
-            apiKeyId: user.apiKeyId,
-            model,
-            promptTokens: promptTokensEst,
-            completionTokens: partialCompletionTokens,
-            cachedTokens: 0,
-            totalTokens: partialTokens,
-            requestDurationMs: Date.now() - startTime,
-            statusCode: finalStatusCode,
-            isStream: true,
-            skipQuotaDeduct: true,
-            upstreamGroup: selectedKey?.group,
-            upstreamKeyName: selectedKey?.name
-          });
-          return;
-        }
-
-        // Calculate final usage
-        const usage = parser.lastUsage;
-        const promptTokens = usage?.prompt_tokens ?? promptTokensEst;
-        const rawCompletionTokens = usage?.completion_tokens ?? parser.estimatedCompletionTokens;
-        const completionTokens = Math.min(rawCompletionTokens, Math.max(0, maxAllowedTokens - promptTokens));
-        const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? 0;
-        const totalTokens = Math.min(usage?.total_tokens ?? (promptTokens + completionTokens), maxAllowedTokens);
+        const promptTokens = usage.prompt_tokens ?? promptTokensEst;
+        const completionContent = (responseJson.choices as any[])?.[0]?.message?.content;
+        const rawCompletion = usage.completion_tokens ?? estimateCompletionTokens(completionContent);
+        const completionTokens = rawCompletion;
+        const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? 0;
+        const totalTokens = usage.total_tokens ?? (promptTokens + completionTokens);
 
         actualTokensUsed = totalTokens;
         cachedTokensUsed = cachedTokens;
@@ -416,35 +531,25 @@ export class ProxyService {
           totalTokens,
           requestDurationMs: Date.now() - startTime,
           statusCode: 200,
-          isStream: true,
+          isStream: false,
           skipQuotaDeduct: true,
           upstreamGroup: selectedKey?.group,
           upstreamKeyName: selectedKey?.name
         });
 
-        return;
-      }
+        return reply.code(200).send(responseJson);
+      } catch (networkOrTimeoutError) {
+        if (!isLastAttempt && !req.raw.destroyed) {
+          console.warn(`[ProxyService] Upstream channel ${selectedKey.name} (${selectedKey.group}) network error. Auto-failing over...`);
+          continue;
+        }
 
-      // Non-streaming JSON response
-      const responseText = await upstreamResponse.body.text();
-      let responseJson: Record<string, unknown>;
-
-      try {
-        responseJson = JSON.parse(responseText);
-      } catch {
-        const sanitized = ErrorSanitizerService.sanitize(502, 'Upstream returned invalid JSON');
-        actualTokensUsed = 0;
-        return reply.code(sanitized.statusCode).send(sanitized.payload);
-      }
-
-      // Check if upstream returned an error object inside HTTP 200
-      if (responseJson.error) {
         const sanitized = ErrorSanitizerService.sanitize(
-          502,
-          `Upstream returned error in HTTP 200: ${JSON.stringify(responseJson.error)}`
+          networkOrTimeoutError,
+          `Network or timeout calling upstream: ${upstreamUrl}`
         );
         actualTokensUsed = 0;
-        finalStatusCode = 502;
+        finalStatusCode = sanitized.statusCode;
 
         await this.usageService.recordApiUsage({
           userId: user.id,
@@ -455,8 +560,8 @@ export class ProxyService {
           cachedTokens: 0,
           totalTokens: 0,
           requestDurationMs: Date.now() - startTime,
-          statusCode: 502,
-          isStream: false,
+          statusCode: sanitized.statusCode,
+          isStream,
           skipQuotaDeduct: true,
           upstreamGroup: selectedKey?.group,
           upstreamKeyName: selectedKey?.name
@@ -464,70 +569,7 @@ export class ProxyService {
 
         return reply.code(sanitized.statusCode).send(sanitized.payload);
       }
-
-      // Extract token usage safely bounded by maxAllowedTokens
-      const usage = (responseJson.usage || {}) as {
-        prompt_tokens?: number;
-        completion_tokens?: number;
-        total_tokens?: number;
-        prompt_tokens_details?: {
-          cached_tokens?: number;
-        };
-      };
-
-      const promptTokens = usage.prompt_tokens ?? promptTokensEst;
-      const completionContent = (responseJson.choices as any[])?.[0]?.message?.content;
-      const rawCompletion = usage.completion_tokens ?? estimateCompletionTokens(completionContent);
-      const completionTokens = rawCompletion;
-      const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? 0;
-      const totalTokens = usage.total_tokens ?? (promptTokens + completionTokens);
-
-      actualTokensUsed = totalTokens;
-      cachedTokensUsed = cachedTokens;
-      finalStatusCode = 200;
-
-      await this.usageService.recordApiUsage({
-        userId: user.id,
-        apiKeyId: user.apiKeyId,
-        model,
-        promptTokens,
-        completionTokens,
-        cachedTokens,
-        totalTokens,
-        requestDurationMs: Date.now() - startTime,
-        statusCode: 200,
-        isStream: false,
-        skipQuotaDeduct: true,
-        upstreamGroup: selectedKey?.group,
-        upstreamKeyName: selectedKey?.name
-      });
-
-      return reply.code(200).send(responseJson);
-    } catch (networkOrTimeoutError) {
-      const sanitized = ErrorSanitizerService.sanitize(
-        networkOrTimeoutError,
-        `Network or timeout calling upstream: ${upstreamUrl}`
-      );
-      actualTokensUsed = 0;
-      finalStatusCode = sanitized.statusCode;
-
-      await this.usageService.recordApiUsage({
-        userId: user.id,
-        apiKeyId: user.apiKeyId,
-        model,
-        promptTokens: 0,
-        completionTokens: 0,
-        cachedTokens: 0,
-        totalTokens: 0,
-        requestDurationMs: Date.now() - startTime,
-        statusCode: sanitized.statusCode,
-        isStream,
-        skipQuotaDeduct: true,
-        upstreamGroup: selectedKey?.group,
-        upstreamKeyName: selectedKey?.name
-      });
-
-      return reply.code(sanitized.statusCode).send(sanitized.payload);
+    }
     } finally {
       req.raw.off('close', onClose);
       // Reconcile optimistic reservation with actual tokens consumed
@@ -646,9 +688,11 @@ export class ProxyService {
       upstreamHeaders['Accept'] = 'text/event-stream';
     }
 
-    const selectedKey = selectKeyForModel(model, this.config.UPSTREAM_KEYS, this.config.UPSTREAM_API_KEY);
-    const effectiveApiKey = selectedKey ? selectedKey.apiKey : this.config.UPSTREAM_API_KEY;
-    if (!effectiveApiKey) {
+    const headerPool = (req.headers['x-channel-preference'] || req.headers['x-pool-preference'] || req.headers['x-model-group'] || req.headers['x-stability-preference']) as string | undefined;
+    const { cleanModel } = parseModelAndPoolPreference(model);
+    const candidateKeys = getOrderedKeysForModel(model, this.config.UPSTREAM_KEYS, headerPool, this.config.UPSTREAM_API_KEY);
+
+    if (candidateKeys.length === 0) {
       return reply.code(400).send({
         error: {
           message: `The requested model '${model}' is not supported by any configured upstream tier, and no fallback API key is configured.`,
@@ -658,8 +702,6 @@ export class ProxyService {
         }
       });
     }
-
-    upstreamHeaders['Authorization'] = `Bearer ${effectiveApiKey}`;
 
     if (req.headers['openai-organization']) {
       upstreamHeaders['openai-organization'] = String(req.headers['openai-organization']);
@@ -671,6 +713,7 @@ export class ProxyService {
 
     // Build capped proxy body to prevent upstream burning tokens beyond available quota
     const proxyBody = { ...body };
+    proxyBody.model = cleanModel;
     if (typeof body.max_tokens === 'number' && typeof body.max_output_tokens !== 'number') {
       proxyBody.max_tokens = upstreamMaxOutput;
     } else {
@@ -687,19 +730,39 @@ export class ProxyService {
     };
     req.raw.on('close', onClose);
 
-    try {
-      const upstreamResponse = await undiciRequest(upstreamUrl, {
-        method: 'POST',
-        headers: upstreamHeaders,
-        body: JSON.stringify(proxyBody),
-        headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
-        bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
-        signal: abortController.signal
-      });
+    let selectedKey: UpstreamKey | null = null;
 
-      const statusCode = upstreamResponse.statusCode;
-      finalStatusCode = statusCode;
-      const contentType = String(upstreamResponse.headers['content-type'] || '');
+    try {
+      for (let keyIdx = 0; keyIdx < candidateKeys.length; keyIdx++) {
+      selectedKey = candidateKeys[keyIdx];
+      const effectiveApiKey = selectedKey.apiKey;
+      const isLastAttempt = keyIdx === candidateKeys.length - 1;
+
+      const currentHeaders: Record<string, string> = {
+        ...upstreamHeaders,
+        'Authorization': `Bearer ${effectiveApiKey}`
+      };
+
+      try {
+        const upstreamResponse = await undiciRequest(upstreamUrl, {
+          method: 'POST',
+          headers: currentHeaders,
+          body: JSON.stringify(proxyBody),
+          headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+          bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+          signal: abortController.signal
+        });
+
+        const statusCode = upstreamResponse.statusCode;
+        finalStatusCode = statusCode;
+        const contentType = String(upstreamResponse.headers['content-type'] || '');
+
+        // Channel offline / busy: failover on 5xx, 429, or 404
+        if ((statusCode >= 500 || statusCode === 429 || statusCode === 404) && !isLastAttempt && !req.raw.destroyed) {
+          try { await upstreamResponse.body.dump(); } catch {}
+          console.warn(`[ProxyService] Upstream Responses channel ${selectedKey.name} (${selectedKey.group}) returned HTTP ${statusCode}. Auto-failing over...`);
+          continue;
+        }
 
       // HTTP Error
       if (statusCode < 200 || statusCode >= 300) {
@@ -950,31 +1013,38 @@ export class ProxyService {
       });
 
       return reply.code(200).send(responseJson);
-    } catch (networkOrTimeoutError) {
-      const sanitized = ErrorSanitizerService.sanitize(
-        networkOrTimeoutError,
-        `Network or timeout calling upstream: ${upstreamUrl}`
-      );
-      actualTokensUsed = 0;
-      finalStatusCode = sanitized.statusCode;
+      } catch (networkOrTimeoutError) {
+        if (!isLastAttempt && !req.raw.destroyed) {
+          console.warn(`[ProxyService] Upstream Responses channel ${selectedKey.name} (${selectedKey.group}) network error. Auto-failing over...`);
+          continue;
+        }
 
-      await this.usageService.recordApiUsage({
-        userId: user.id,
-        apiKeyId: user.apiKeyId,
-        model,
-        promptTokens: 0,
-        completionTokens: 0,
-        cachedTokens: 0,
-        totalTokens: 0,
-        requestDurationMs: Date.now() - startTime,
-        statusCode: sanitized.statusCode,
-        isStream,
-        skipQuotaDeduct: true,
-        upstreamGroup: selectedKey?.group,
-        upstreamKeyName: selectedKey?.name
-      });
+        const sanitized = ErrorSanitizerService.sanitize(
+          networkOrTimeoutError,
+          `Network or timeout calling upstream: ${upstreamUrl}`
+        );
+        actualTokensUsed = 0;
+        finalStatusCode = sanitized.statusCode;
 
-      return reply.code(sanitized.statusCode).send(sanitized.payload);
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens: 0,
+          requestDurationMs: Date.now() - startTime,
+          statusCode: sanitized.statusCode,
+          isStream,
+          skipQuotaDeduct: true,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return reply.code(sanitized.statusCode).send(sanitized.payload);
+      }
+    }
     } finally {
       req.raw.off('close', onClose);
       await this.quotaService.reconcileQuota(
@@ -1097,9 +1167,12 @@ export class ProxyService {
       upstreamHeaders['Accept'] = 'text/event-stream';
     }
 
-    const selectedKey = selectKeyForModel(model, this.config.UPSTREAM_KEYS, this.config.UPSTREAM_API_KEY);
-    const effectiveApiKey = selectedKey ? selectedKey.apiKey : this.config.UPSTREAM_API_KEY;
-    if (!effectiveApiKey) {
+    const headerPool = (req.headers['x-channel-preference'] || req.headers['x-pool-preference'] || req.headers['x-model-group'] || req.headers['x-stability-preference']) as string | undefined;
+    const { cleanModel } = parseModelAndPoolPreference(model);
+    const normalizedCleanModel = normalizeModelAlias(cleanModel);
+    const candidateKeys = getOrderedKeysForModel(model, this.config.UPSTREAM_KEYS, headerPool, this.config.UPSTREAM_API_KEY);
+
+    if (candidateKeys.length === 0) {
       return reply.code(400).send({
         type: 'error',
         error: {
@@ -1109,13 +1182,13 @@ export class ProxyService {
       });
     }
 
-    upstreamHeaders['x-api-key'] = effectiveApiKey;
     upstreamHeaders['anthropic-version'] = String(req.headers['anthropic-version'] || '2023-06-01');
     if (req.headers['anthropic-beta']) {
       upstreamHeaders['anthropic-beta'] = String(req.headers['anthropic-beta']);
     }
 
     const proxyBody = { ...body };
+    proxyBody.model = normalizedCleanModel;
     proxyBody.max_tokens = upstreamMaxCompletion;
 
     const abortController = new AbortController();
@@ -1124,18 +1197,38 @@ export class ProxyService {
     };
     req.raw.on('close', onClose);
 
-    try {
-      const upstreamResponse = await undiciRequest(upstreamUrl, {
-        method: 'POST',
-        headers: upstreamHeaders,
-        body: JSON.stringify(proxyBody),
-        headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
-        bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
-        signal: abortController.signal
-      });
+    let selectedKey: UpstreamKey | null = null;
 
-      const statusCode = upstreamResponse.statusCode;
-      finalStatusCode = statusCode;
+    try {
+      for (let keyIdx = 0; keyIdx < candidateKeys.length; keyIdx++) {
+      selectedKey = candidateKeys[keyIdx];
+      const effectiveApiKey = selectedKey.apiKey;
+      const isLastAttempt = keyIdx === candidateKeys.length - 1;
+
+      const currentHeaders: Record<string, string> = {
+        ...upstreamHeaders,
+        'x-api-key': effectiveApiKey
+      };
+
+      try {
+        const upstreamResponse = await undiciRequest(upstreamUrl, {
+          method: 'POST',
+          headers: currentHeaders,
+          body: JSON.stringify(proxyBody),
+          headersTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+          bodyTimeout: this.config.UPSTREAM_TIMEOUT_MS,
+          signal: abortController.signal
+        });
+
+        const statusCode = upstreamResponse.statusCode;
+        finalStatusCode = statusCode;
+
+        // Channel offline / busy: failover on 5xx, 429, or 404
+        if ((statusCode >= 500 || statusCode === 429 || statusCode === 404) && !isLastAttempt && !req.raw.destroyed) {
+          try { await upstreamResponse.body.dump(); } catch {}
+          console.warn(`[ProxyService] Upstream Messages channel ${selectedKey.name} (${selectedKey.group}) returned HTTP ${statusCode}. Auto-failing over...`);
+          continue;
+        }
 
       if (statusCode < 200 || statusCode >= 300) {
         let rawErrorBody = '';
@@ -1280,6 +1373,9 @@ export class ProxyService {
       try {
         responseJson = JSON.parse(responseText);
       } catch {
+        if (!isLastAttempt && !req.raw.destroyed) {
+          continue;
+        }
         const sanitized = ErrorSanitizerService.sanitize(502, 'Upstream Messages returned invalid JSON');
         actualTokensUsed = 0;
         return reply.code(sanitized.statusCode).send({
@@ -1292,6 +1388,10 @@ export class ProxyService {
       }
 
       if (responseJson.type === 'error' || responseJson.error) {
+        if (!isLastAttempt && !req.raw.destroyed) {
+          console.warn(`[ProxyService] Upstream Messages channel ${selectedKey.name} returned error in body. Auto-failing over...`);
+          continue;
+        }
         const sanitized = ErrorSanitizerService.sanitize(
           502,
           `Upstream Messages returned error: ${JSON.stringify(responseJson.error || responseJson)}`
@@ -1364,37 +1464,44 @@ export class ProxyService {
       });
 
       return reply.code(200).send(responseJson);
-    } catch (networkOrTimeoutError) {
-      const sanitized = ErrorSanitizerService.sanitize(
-        networkOrTimeoutError,
-        `Network or timeout calling upstream Messages: ${upstreamUrl}`
-      );
-      actualTokensUsed = 0;
-      finalStatusCode = sanitized.statusCode;
-
-      await this.usageService.recordApiUsage({
-        userId: user.id,
-        apiKeyId: user.apiKeyId,
-        model,
-        promptTokens: 0,
-        completionTokens: 0,
-        cachedTokens: 0,
-        totalTokens: 0,
-        requestDurationMs: Date.now() - startTime,
-        statusCode: sanitized.statusCode,
-        isStream,
-        skipQuotaDeduct: true,
-        upstreamGroup: selectedKey?.group,
-        upstreamKeyName: selectedKey?.name
-      });
-
-      return reply.code(sanitized.statusCode).send({
-        type: 'error',
-        error: {
-          type: 'api_error',
-          message: sanitized.payload.error.message
+      } catch (networkOrTimeoutError) {
+        if (!isLastAttempt && !req.raw.destroyed) {
+          console.warn(`[ProxyService] Upstream Messages channel ${selectedKey.name} (${selectedKey.group}) network error. Auto-failing over...`);
+          continue;
         }
-      });
+
+        const sanitized = ErrorSanitizerService.sanitize(
+          networkOrTimeoutError,
+          `Network or timeout calling upstream Messages: ${upstreamUrl}`
+        );
+        actualTokensUsed = 0;
+        finalStatusCode = sanitized.statusCode;
+
+        await this.usageService.recordApiUsage({
+          userId: user.id,
+          apiKeyId: user.apiKeyId,
+          model,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          totalTokens: 0,
+          requestDurationMs: Date.now() - startTime,
+          statusCode: sanitized.statusCode,
+          isStream,
+          skipQuotaDeduct: true,
+          upstreamGroup: selectedKey?.group,
+          upstreamKeyName: selectedKey?.name
+        });
+
+        return reply.code(sanitized.statusCode).send({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: sanitized.payload.error.message
+          }
+        });
+      }
+    }
     } finally {
       req.raw.off('close', onClose);
       await this.quotaService.reconcileQuota(
