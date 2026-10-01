@@ -48,6 +48,8 @@ export interface IStore {
     completionTokens: number;
     cachedTokens: number;
     totalTokens: number;
+    deductedTokens?: number;
+    rateMultiplier?: number;
     requestDurationMs: number;
     statusCode: number;
     isStream: boolean;
@@ -876,6 +878,8 @@ export class MemoryStore implements IStore {
     completionTokens: number;
     cachedTokens: number;
     totalTokens: number;
+    deductedTokens?: number;
+    rateMultiplier?: number;
     requestDurationMs: number;
     statusCode: number;
     isStream: boolean;
@@ -891,6 +895,8 @@ export class MemoryStore implements IStore {
       completionTokens: data.completionTokens,
       cachedTokens: data.cachedTokens,
       totalTokens: data.totalTokens,
+      deductedTokens: data.deductedTokens !== undefined ? data.deductedTokens : data.totalTokens,
+      rateMultiplier: data.rateMultiplier,
       requestDurationMs: data.requestDurationMs,
       statusCode: data.statusCode,
       isStream: data.isStream,
