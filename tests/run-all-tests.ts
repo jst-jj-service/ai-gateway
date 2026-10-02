@@ -7,6 +7,7 @@ import { runPersistenceTests } from './persistence.test';
 import { runAdversarialQuotaTests } from './adversarial-quota.test';
 import { runUpstreamRoutingTests } from './upstream-routing.test';
 import { runAdminRoutesTests } from './admin-routes.test';
+import { runStaticServingTests } from './static-serving.test';
 
 async function main() {
   console.log('====================================================');
@@ -26,7 +27,8 @@ async function main() {
     { name: 'JSON File Persistence & Data Recovery', fn: runPersistenceTests },
     { name: 'Adversarial Attacks & Anti-Free-Usage Guarantees', fn: runAdversarialQuotaTests },
     { name: 'Multi-Key Intelligent Model Routing', fn: runUpstreamRoutingTests },
-    { name: 'Admin User Management & System Stats', fn: runAdminRoutesTests }
+    { name: 'Admin User Management & System Stats', fn: runAdminRoutesTests },
+    { name: 'Web Dashboard & Client Portal Serving', fn: runStaticServingTests }
   ];
 
   for (const suite of suites) {
