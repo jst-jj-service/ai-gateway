@@ -67,6 +67,9 @@ export interface UsageRecord {
   createdAt: Date;
   upstreamGroup?: string;
   upstreamKeyName?: string;
+  firstTokenDurationMs?: number;
+  costUsd?: number;
+  upstreamCostUsd?: number;
 }
 
 export interface AuthenticatedUser {
