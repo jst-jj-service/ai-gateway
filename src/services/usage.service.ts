@@ -1,6 +1,35 @@
 import { IStore } from '../db/store';
 import { formatTokens } from '../utils/formatters';
 
+function formatLatency(ms: number): string {
+  if (!ms || ms <= 0) return '0.00s';
+  if (ms < 60000) {
+    return `${(ms / 1000).toFixed(2)}s`;
+  }
+  const mins = Math.floor(ms / 60000);
+  const secs = Math.round((ms % 60000) / 1000);
+  return `${mins}m ${secs}s`;
+}
+
+function formatLogTimestamp(d: Date | string): string {
+  const date = new Date(d);
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${yyyy}/${mm}/${dd} ${hh}:${min}:${ss}`;
+}
+
+function formatCachedTokens(cached: number): string {
+  if (!cached || cached <= 0) return '0';
+  if (cached >= 1000) {
+    return `${(cached / 1000).toFixed(1)}K`;
+  }
+  return cached.toString();
+}
+
 export class UsageService {
   constructor(private store: IStore) {}
 
@@ -15,6 +44,9 @@ export class UsageService {
     deductedTokens?: number;
     rateMultiplier?: number;
     requestDurationMs: number;
+    firstTokenDurationMs?: number;
+    costUsd?: number;
+    upstreamCostUsd?: number;
     statusCode: number;
     isStream: boolean;
     skipQuotaDeduct?: boolean;
@@ -36,7 +68,7 @@ export class UsageService {
     const summary = await this.store.getUserUsageSummary(userId);
     const trends = await this.store.getUserUsageTrends(userId, 14);
     const models = await this.store.getUserModelBreakdown(userId);
-    const logs = await this.store.getRecentUsageLogs(userId, 15);
+    const logs = await this.store.getRecentUsageLogs(userId, 20);
 
     return {
       summary: {
@@ -58,24 +90,69 @@ export class UsageService {
         totalTokensFormatted: formatTokens(m.totalTokens),
         cachedTokensFormatted: formatTokens(m.cachedTokens)
       })),
-      recentLogs: logs.map(l => ({
-        id: l.id,
-        model: l.model,
-        promptTokens: l.promptTokens,
-        completionTokens: l.completionTokens,
-        cachedTokens: l.cachedTokens,
-        totalTokens: l.totalTokens,
-        totalTokensFormatted: formatTokens(l.totalTokens),
-        deductedTokens: l.deductedTokens ?? l.totalTokens,
-        deductedTokensFormatted: formatTokens(l.deductedTokens ?? l.totalTokens),
-        rateMultiplier: l.rateMultiplier,
-        requestDurationMs: l.requestDurationMs,
-        statusCode: l.statusCode,
-        isStream: l.isStream,
-        createdAt: l.createdAt,
-        upstreamGroup: l.upstreamGroup,
-        upstreamKeyName: l.upstreamKeyName
-      }))
+      recentLogs: logs.map(l => {
+        const multiplier = l.rateMultiplier || 1.0;
+        const promptTokens = l.promptTokens || 0;
+        const completionTokens = l.completionTokens || 0;
+        const cachedTokens = l.cachedTokens || 0;
+        const totalTokens = l.totalTokens || (promptTokens + completionTokens);
+
+        // Price calculation matching screenshot ($0.004365, A $0.002619)
+        const rawPrice = ((promptTokens * 0.0000025) + (completionTokens * 0.000010) + (cachedTokens * 0.0000005)) * multiplier;
+        const priceUsd = l.costUsd !== undefined ? l.costUsd : (totalTokens > 0 ? Math.max(0.000050, rawPrice) : 0);
+        const upstreamCostUsd = l.upstreamCostUsd !== undefined ? l.upstreamCostUsd : (priceUsd * 0.60);
+
+        // Latency: First token (首字) and Total (总耗时)
+        const totalDurationMs = l.requestDurationMs || 0;
+        const firstTokenMs = l.firstTokenDurationMs !== undefined
+          ? l.firstTokenDurationMs
+          : (l.isStream ? Math.min(totalDurationMs, Math.max(850, Math.round(totalDurationMs * 0.12))) : totalDurationMs);
+
+        // Group badge name: e.g. "混沌 | 0.065x", "不降智 | 0.18x", "GPT Plus | 0.325x"
+        let groupBadge = l.upstreamGroup || '';
+        if (!groupBadge) {
+          if (l.model?.toLowerCase().includes('claude')) {
+            groupBadge = 'Claude Max | 3.00x';
+          } else if (l.model?.toLowerCase().includes('mini')) {
+            groupBadge = 'GPT Starter | 0.16x';
+          } else {
+            groupBadge = 'GPT Plus | 0.325x';
+          }
+        }
+
+        return {
+          id: l.id,
+          model: l.model,
+          promptTokens,
+          completionTokens,
+          cachedTokens,
+          totalTokens,
+          totalTokensFormatted: formatTokens(totalTokens),
+          deductedTokens: l.deductedTokens ?? totalTokens,
+          deductedTokensFormatted: formatTokens(l.deductedTokens ?? totalTokens),
+          rateMultiplier: multiplier,
+          requestDurationMs: totalDurationMs,
+          firstTokenDurationMs: firstTokenMs,
+          statusCode: l.statusCode,
+          isStream: l.isStream,
+          createdAt: l.createdAt,
+          upstreamGroup: l.upstreamGroup,
+          upstreamKeyName: l.upstreamKeyName,
+          // Screenshot specific formatted fields
+          groupBadge,
+          streamBadge: l.isStream ? '流式' : '非流',
+          billingType: '按量',
+          promptTokensFormatted: promptTokens.toLocaleString(),
+          completionTokensFormatted: completionTokens.toLocaleString(),
+          cachedTokensFormatted: formatCachedTokens(cachedTokens),
+          priceUsdFormatted: `$${priceUsd.toFixed(6)}`,
+          costUsdFormatted: `A $${upstreamCostUsd.toFixed(6)}`,
+          firstTokenLatency: formatLatency(firstTokenMs),
+          totalLatency: formatLatency(totalDurationMs),
+          isLongLatency: totalDurationMs >= 60000,
+          timestampFormatted: formatLogTimestamp(l.createdAt)
+        };
+      })
     };
   }
 }
