@@ -256,4 +256,11 @@ export class ErrorSanitizerService {
     };
     return `data: ${JSON.stringify(errorPayload)}\n\n`;
   }
+
+  /**
+   * Sanitizes an upstream error text with HTTP status code.
+   */
+  public static sanitizeError(errText: string, statusCode: number) {
+    return this.sanitize(statusCode, errText);
+  }
 }
