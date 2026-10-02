@@ -63,8 +63,24 @@ export async function v1Routes(
     return proxyService.handleChatCompletion(req, reply, req.user!);
   });
 
+  // POST /chat/completions (Direct route alias for tools pointing BASE_URL to root or /v1)
+  fastify.post('/chat/completions', async (req, reply) => {
+    const passed = await proxyPreHandler(req, reply);
+    if (!passed) return;
+
+    return proxyService.handleChatCompletion(req, reply, req.user!);
+  });
+
   // POST /v1/responses (OpenAI Responses API compatible)
   fastify.post('/v1/responses', async (req, reply) => {
+    const passed = await proxyPreHandler(req, reply);
+    if (!passed) return;
+
+    return proxyService.handleResponses(req, reply, req.user!);
+  });
+
+  // POST /responses (Direct route alias)
+  fastify.post('/responses', async (req, reply) => {
     const passed = await proxyPreHandler(req, reply);
     if (!passed) return;
 
