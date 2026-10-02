@@ -143,7 +143,28 @@ export async function runAdminRoutesTests() {
   assert.strictEqual(reactivateRes.statusCode, 200);
   assert.strictEqual(JSON.parse(reactivateRes.body).user.isActive, true);
 
-  // 12. Admin tries to delete themselves -> 400 blocked
+  // 12. Admin resets Bob's password
+  const resetPassRes = await app.inject({
+    method: 'POST',
+    url: `/api/admin/users/${bobId}/reset-password`,
+    headers: { Authorization: `Bearer ${adminToken}` },
+    payload: { newPassword: 'NewBobSecurePass2026!' }
+  });
+  assert.strictEqual(resetPassRes.statusCode, 200);
+  assert.strictEqual(JSON.parse(resetPassRes.body).success, true);
+
+  // Bob can now log in with the new password
+  const bobNewLogin = await app.inject({
+    method: 'POST',
+    url: '/api/auth/login',
+    payload: {
+      email: 'bob@tester.com',
+      password: 'NewBobSecurePass2026!'
+    }
+  });
+  assert.strictEqual(bobNewLogin.statusCode, 200);
+
+  // 13. Admin tries to delete themselves -> 400 blocked
   const selfDeleteRes = await app.inject({
     method: 'DELETE',
     url: `/api/admin/users/${adminUser.id}`,
@@ -151,7 +172,7 @@ export async function runAdminRoutesTests() {
   });
   assert.strictEqual(selfDeleteRes.statusCode, 400);
 
-  // 13. Admin deletes Bob's account
+  // 14. Admin deletes Bob's account
   const deleteRes = await app.inject({
     method: 'DELETE',
     url: `/api/admin/users/${bobId}`,
