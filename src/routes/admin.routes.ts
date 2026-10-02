@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import bcrypt from 'bcryptjs';
 import { IStore } from '../db/store';
 import { QuotaService } from '../services/quota.service';
 import { UsageService } from '../services/usage.service';
@@ -12,6 +13,10 @@ const updateStatusSchema = z.object({
 
 const addCreditsSchema = z.object({
   tokens: z.coerce.number().int().positive('Token amount must be greater than 0')
+});
+
+const resetPasswordSchema = z.object({
+  newPassword: z.string().min(6, 'Password must be at least 6 characters')
 });
 
 export async function adminRoutes(
@@ -205,6 +210,34 @@ export async function adminRoutes(
     return reply.send({
       success: true,
       message: 'User account and associated data removed successfully'
+    });
+  });
+
+  // POST /api/admin/users/:id/reset-password - Reset user password
+  fastify.post('/api/admin/users/:id/reset-password', async (req, reply) => {
+    const isAdmin = await authPlugin.requireAdmin(req, reply);
+    if (!isAdmin) return;
+
+    const { id } = req.params as { id: string };
+    const user = await store.getUserById(id);
+    if (!user) {
+      return reply.code(404).send({ error: { message: 'User not found' } });
+    }
+
+    const parseResult = resetPasswordSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return reply.code(400).send({
+        error: { message: parseResult.error.errors[0]?.message || 'Invalid password format' }
+      });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(parseResult.data.newPassword, salt);
+    await store.updateUserPassword(id, passwordHash);
+
+    return reply.send({
+      success: true,
+      message: `Password for ${user.email} has been reset successfully.`
     });
   });
 }
