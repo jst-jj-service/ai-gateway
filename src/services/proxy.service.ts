@@ -1713,7 +1713,16 @@ export class ProxyService {
       { id: 'claude-3-5-sonnet-20240620', object: 'model', created: 1718800000, owned_by: 'system' },
       { id: 'claude-sonnet-5-5', object: 'model', created: 1740000000, owned_by: 'system' },
       { id: 'claude-opus-4-5', object: 'model', created: 1740000000, owned_by: 'system' },
-      { id: 'claude-max', object: 'model', created: 1740000000, owned_by: 'system' }
+      { id: 'claude-max', object: 'model', created: 1740000000, owned_by: 'system' },
+
+      // Embeddings
+      { id: 'text-embedding-3-small', object: 'model', created: 1705948997, owned_by: 'system' },
+      { id: 'text-embedding-3-large', object: 'model', created: 1705948997, owned_by: 'system' },
+      { id: 'text-embedding-ada-002', object: 'model', created: 1671217299, owned_by: 'system' },
+
+      // Legacy / Turbo
+      { id: 'gpt-4-turbo', object: 'model', created: 1712361441, owned_by: 'system' },
+      { id: 'gpt-3.5-turbo', object: 'model', created: 1677610602, owned_by: 'system' }
     ];
 
     return reply.code(200).send({
