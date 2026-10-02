@@ -102,13 +102,13 @@ export class UsageService {
         const priceUsd = l.costUsd !== undefined ? l.costUsd : (totalTokens > 0 ? Math.max(0.000050, rawPrice) : 0);
         const upstreamCostUsd = l.upstreamCostUsd !== undefined ? l.upstreamCostUsd : (priceUsd * 0.60);
 
-        // Latency: First token (首字) and Total (总耗时)
+        // Latency: First token (TTFT) and Total duration
         const totalDurationMs = l.requestDurationMs || 0;
         const firstTokenMs = l.firstTokenDurationMs !== undefined
           ? l.firstTokenDurationMs
           : (l.isStream ? Math.min(totalDurationMs, Math.max(850, Math.round(totalDurationMs * 0.12))) : totalDurationMs);
 
-        // Group badge name: e.g. "混沌 | 0.065x", "不降智 | 0.18x", "GPT Plus | 0.325x"
+        // Group badge name: e.g. "GPT Plus | 0.325x", "Claude Max | 3.00x"
         let groupBadge = l.upstreamGroup || '';
         if (!groupBadge) {
           if (l.model?.toLowerCase().includes('claude')) {
@@ -140,8 +140,8 @@ export class UsageService {
           upstreamKeyName: l.upstreamKeyName,
           // Screenshot specific formatted fields
           groupBadge,
-          streamBadge: l.isStream ? '流式' : '非流',
-          billingType: '按量',
+          streamBadge: l.isStream ? 'Stream' : 'Standard',
+          billingType: 'Pay-per-use',
           promptTokensFormatted: promptTokens.toLocaleString(),
           completionTokensFormatted: completionTokens.toLocaleString(),
           cachedTokensFormatted: formatCachedTokens(cachedTokens),
