@@ -55,6 +55,9 @@ export interface IStore {
     isStream: boolean;
     upstreamGroup?: string;
     upstreamKeyName?: string;
+    firstTokenDurationMs?: number;
+    costUsd?: number;
+    upstreamCostUsd?: number;
   }): Promise<UsageRecord>;
 
   getUserUsageSummary(userId: string): Promise<{
@@ -885,6 +888,9 @@ export class MemoryStore implements IStore {
     isStream: boolean;
     upstreamGroup?: string;
     upstreamKeyName?: string;
+    firstTokenDurationMs?: number;
+    costUsd?: number;
+    upstreamCostUsd?: number;
   }): Promise<UsageRecord> {
     const record: UsageRecord = {
       id: 'usg_' + crypto.randomBytes(12).toString('hex'),
@@ -898,6 +904,9 @@ export class MemoryStore implements IStore {
       deductedTokens: data.deductedTokens !== undefined ? data.deductedTokens : data.totalTokens,
       rateMultiplier: data.rateMultiplier,
       requestDurationMs: data.requestDurationMs,
+      firstTokenDurationMs: data.firstTokenDurationMs,
+      costUsd: data.costUsd,
+      upstreamCostUsd: data.upstreamCostUsd,
       statusCode: data.statusCode,
       isStream: data.isStream,
       createdAt: new Date(),
